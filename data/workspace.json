@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "revision": "5e18a18eebf6c8ad6fc96ea3",
+  "settings": {
+    "workspaceName": "Marketing Control Center",
+    "postReviewDays": 7
+  },
+  "clients": [],
+  "accounts": [],
+  "campaigns": [],
+  "strategies": [],
+  "posts": [],
+  "metrics": [],
+  "assessments": [],
+  "reminders": [],
+  "practices": [],
+  "activity": []
+}
