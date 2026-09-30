@@ -99,6 +99,9 @@ try {
   console.log(
     'Recipients: double-click Open Pulse.command on Mac, open the folder as a local Codex project and say "hi", or run npm ci then npm start.',
   );
+  console.log(
+    'Mac recipients approve the launcher once: after the first warning, choose System Settings > Privacy & Security > Open Anyway (see README "First launch on a Mac").',
+  );
 } catch (error) {
   console.error(`Packaging failed: ${error.message}`);
   process.exitCode = 1;

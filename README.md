@@ -15,6 +15,15 @@ npm start
 
 On a Mac, double-click **Open Pulse.command** in this folder. It starts Pulse and opens it in your default browser when ready. Keep the Terminal window open while using the app; Ctrl+C stops the server. Node.js 22 or newer is required. The first start installs dependencies, builds the interface, and opens an empty workspace. Future starts preserve your work.
 
+### First launch on a Mac (security warning)
+
+Pulse is not signed by an Apple-registered developer, so a Mac blocks the launcher the first time it is opened from a download. You'll see a message like "Apple could not verify 'Open Pulse.command' is free of malware". You only need to approve it once, using either method:
+
+- **System Settings:** Double-click `Open Pulse.command` and click **Done**. Open **System Settings → Privacy & Security** and scroll to **Security**. Click **Open Anyway** next to the Open Pulse message, then confirm with your password. After that, double-clicking works normally.
+- **Terminal:** Open Terminal, type `sh` followed by a space, drag `Open Pulse.command` into the window, and press Return.
+
+On macOS 14 and earlier, you can also right-click (Control-click) the file, choose **Open**, then choose **Open** again.
+
 You can also open [Pulse in your browser](http://127.0.0.1:4310) after running `npm start`. Windows users can run `scripts/start-windows.cmd`.
 
 The project uses Codex's documented project-instruction mechanism. See the [official AGENTS.md documentation](https://learn.chatgpt.com/docs/agent-configuration/agents-md). The greeting flow runs when you send a message; this folder alone cannot wake Codex or launch itself in the background.
@@ -68,7 +77,7 @@ Run:
 npm run package
 ```
 
-Share the new folder printed under `releases/` (zip it if convenient). The package uses an explicit source-file allowlist and contains instructions, the dependency lockfile, and the Mac launcher. It **excludes your live workspace, backups, attachments, installed dependencies, and hidden configuration**. Recipients install Node.js and double-click `Open Pulse.command` on Mac, open the received folder as their own local Codex project and say “hi”, or run `npm ci` and `npm start`. Each recipient gets a separate empty workspace.
+Share the new folder printed under `releases/` (zip it if convenient). The package uses an explicit source-file allowlist and contains instructions, the dependency lockfile, and the Mac launcher. It **excludes your live workspace, backups, attachments, installed dependencies, and hidden configuration**. Recipients install Node.js and double-click `Open Pulse.command` on Mac (approving it once, as described in [First launch on a Mac](#first-launch-on-a-mac-security-warning)), open the received folder as their own local Codex project and say “hi”, or run `npm ci` and `npm start`. Each recipient gets a separate empty workspace.
 
 To give someone your actual campaigns and history instead, use an explicit workspace export and follow the recovery steps in the workflow guide. Treat that as sharing your client data.
 
