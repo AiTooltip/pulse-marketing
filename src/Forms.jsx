@@ -1,3 +1,4 @@
+import { loadLibrary, saveLibraryPlatform } from "./library.js";
 import React, { useState } from "react";
 import {
   Plus,
@@ -7,8 +8,23 @@ import {
   LoaderCircle,
   ArrowRight,
 } from "lucide-react";
-import { Dialog, Field, uid, Platform, titleCase } from "./components.jsx";
-import { today, addDays } from "../shared/domain.mjs";
+import {
+  Dialog,
+  Field,
+  NumInput,
+  PeriodSelect,
+  UNITS,
+  windowLabel,
+  uid,
+  Platform,
+  titleCase,
+  fmt,
+  niceDate,
+} from "./components.jsx";
+import { today, addDays, goalProgress } from "../shared/domain.mjs";
+import MetricBatch from "./MetricBatch.jsx";
+import UploadedVideo from "./UploadedVideo.jsx";
+import TacticPicker, { pendingTacticOps } from "./TacticPicker.jsx";
 const collectionMap = {
   client: "clients",
   account: "accounts",
@@ -26,11 +42,106 @@ const labels = {
   campaign: "campaign",
   strategy: "strategy",
   post: "content plan",
-  metric: "metric",
+  metric: "number",
   assessment: "assessment",
   reminder: "reminder",
-  practice: "best practice",
+  practice: "learning",
 };
+const TARGET_COLLECTION = {
+  campaign: "campaigns",
+  strategy: "strategies",
+  post: "posts",
+};
+/** "Views: 5,200 (per week, Oct 3)" — the newest number per KPI and window. */
+function latestPerKpi(state, metrics, withHandle, limit = 5) {
+  const latest = new Map();
+  for (const m of [...metrics].sort((a, b) => a.date.localeCompare(b.date)))
+    latest.set(`${m.accountId}|${m.kpiId}|${m.periodDays || 0}`, m);
+  const all = [...latest.values()].sort((a, b) => b.date.localeCompare(a.date));
+  const lines = all.slice(0, limit).map((m) => {
+    const account = state.accounts.find((a) => a.id === m.accountId);
+    const kpi = account?.kpis.find((k) => k.id === m.kpiId);
+    const when = [m.periodDays ? windowLabel(m.periodDays) : null, niceDate(m.date)]
+      .filter(Boolean)
+      .join(", ");
+    return `${withHandle && account ? `${account.handle} ` : ""}${kpi?.name || "Number"}: ${fmt(m.value, kpi?.unit)} (${when})`;
+  });
+  return { lines, more: Math.max(0, all.length - limit) };
+}
+/** What an assessment is about, and the latest results to judge it by. */
+export function reviewTarget(state, entityType, entityId) {
+  const entity = (state[TARGET_COLLECTION[entityType]] || []).find(
+    (x) => x.id === entityId,
+  );
+  if (!entity) return null;
+  let found = { lines: [], more: 0 };
+  if (entityType === "post")
+    found = latestPerKpi(
+      state,
+      state.metrics.filter((m) => m.postId === entity.id),
+    );
+  if (entityType === "strategy") {
+    const posts = new Set(
+      state.posts.filter((p) => p.strategyId === entity.id).map((p) => p.id),
+    );
+    const rows = state.metrics.filter(
+      (m) => m.strategyId === entity.id || posts.has(m.postId),
+    );
+    found = latestPerKpi(
+      state,
+      rows,
+      new Set(rows.map((m) => m.accountId)).size > 1,
+    );
+  }
+  if (entityType === "campaign")
+    found.lines = entity.goals
+      .map((g) => {
+        const p = goalProgress(state, entity, g);
+        if (!p.hasData) return null;
+        const account = state.accounts.find((a) => a.id === g.accountId);
+        const kpi = account?.kpis.find((k) => k.id === g.kpiId);
+        return `${kpi?.name || "Goal"}${g.periodDays ? ` ${windowLabel(g.periodDays)}` : ""} (${account?.handle || "account"}): ${fmt(p.current, kpi?.unit)} of ${fmt(g.target, kpi?.unit)} · ${Math.round(p.percent)}% of the way`;
+      })
+      .filter(Boolean);
+  return {
+    label: `${titleCase(entityType)} you're reviewing`,
+    title: entity.name || entity.title,
+    results: found.lines,
+    more: found.more,
+  };
+}
+/** Newest whole-account running total for a KPI, if one was recorded. */
+export const latestTotal = (state, accountId, kpiId, periodDays = 0) =>
+  state.metrics
+    .filter(
+      (m) =>
+        m.accountId === accountId &&
+        m.kpiId === kpiId &&
+        !m.postId &&
+        !m.strategyId &&
+        (m.periodDays || 0) === (Number(periodDays) || 0),
+    )
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .at(-1) || null;
+
+/** A blank goal, pre-filled from the client's first account and its latest number. */
+export function newGoal(state, clientId, usedKeys = []) {
+  const accounts = state.accounts.filter((a) => a.clientId === clientId);
+  const pairs = accounts.flatMap((a) => a.kpis.map((k) => [a, k]));
+  const [a, k] =
+    pairs.find(([a, k]) => !usedKeys.includes(`${a.id}:${k.id}:0`)) ||
+    pairs[0] ||
+    [];
+  const latest = a && k ? latestTotal(state, a.id, k.id) : null;
+  return {
+    id: uid("goal"),
+    accountId: a?.id || "",
+    kpiId: k?.id || "",
+    baseline: latest ? String(latest.value) : "",
+    target: "",
+  };
+}
+
 function defaults(type, state, clientId) {
   const client =
     state.clients.find((c) => c.id === clientId) || state.clients[0];
@@ -83,7 +194,7 @@ function defaults(type, state, clientId) {
       nextReviewDate: addDays(today(), 7),
     },
     post: {
-      campaignId: campaign?.id || "",
+      campaignId: "",
       accountId: account?.id || "",
       strategyId: "",
       title: "",
@@ -103,6 +214,7 @@ function defaults(type, state, clientId) {
       postId: "",
       date: today(),
       value: "",
+      periodDays: "",
       source: "manual",
     },
     assessment: {
@@ -145,17 +257,70 @@ export default function EntityForm({
   clientId,
   onClose,
   onSave,
+  onSaveMany,
   onDelete,
+  openResults,
+  openStrategy,
 }) {
   const { type, value, prefill } = modal;
-  const [form, setForm] = useState(() => ({
-    ...defaults(type, state, clientId),
-    ...prefill,
-    ...value,
-  }));
+  const [form, setForm] = useState(() => {
+    const start = {
+      ...defaults(type, state, clientId),
+      ...prefill,
+      ...value,
+    };
+    // Opened from a campaign or strategy: start on one of that client's accounts.
+    if (type === "post" && start.campaignId) {
+      const owner = state.campaigns.find((c) => c.id === start.campaignId)?.clientId;
+      const current = state.accounts.find((a) => a.id === start.accountId);
+      if (owner && current?.clientId !== owner)
+        start.accountId =
+          state.accounts.find((a) => a.clientId === owner)?.id || start.accountId;
+    }
+    return start;
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  // An assessment opened for a specific item hides the picker until asked.
+  const [pickTarget, setPickTarget] = useState(
+    () =>
+      type === "assessment" &&
+      !reviewTarget(
+        state,
+        { ...prefill, ...value }.entityType || "campaign",
+        { ...prefill, ...value }.entityId,
+      ),
+  );
+  const [customUnits, setCustomUnits] = useState([]);
+  const [pendingTactics, setPendingTactics] = useState([]);
+  const [addingPlatform, setAddingPlatform] = useState(false);
+  const [newPlatformName, setNewPlatformName] = useState("");
+  const applyNewPlatform = () => {
+    const name = newPlatformName.trim();
+    if (!name) return;
+    saveLibraryPlatform(name);
+    set("platform", name);
+    setAddingPlatform(false);
+    setNewPlatformName("");
+  };
+  const uploadPost =
+    type === "metric" && form.postId
+      ? state.posts.find((p) => p.id === form.postId)
+      : null;
+  const uploadOf = uploadPost ? uploadPost.executedAt || uploadPost.date : "";
+  const addGoal = () =>
+    setForm((f) => ({
+      ...f,
+      goals: [
+        ...f.goals,
+        newGoal(
+          state,
+          f.clientId,
+          f.goals.map((g) => `${g.accountId}:${g.kpiId}:${g.periodDays || 0}`),
+        ),
+      ],
+    }));
   const set = (key, val) => setForm((f) => ({ ...f, [key]: val }));
   const input = (key, props = {}) => (
     <input
@@ -197,9 +362,19 @@ export default function EntityForm({
   const allCampaigns = state.campaigns.map((c) => ({ id: c.id, name: c.name }));
   const account = state.accounts.find((a) => a.id === form.accountId);
   const campaign = state.campaigns.find((c) => c.id === form.campaignId);
-  const accountOptions = state.accounts
-    .filter((a) => (type === "post" ? a.clientId === campaign?.clientId : true))
-    .map((a) => ({ id: a.id, name: `${a.handle} · ${a.platform}` }));
+  const multiClient = state.clients.length > 1;
+  const accountOptions = state.accounts.map((a) => ({
+    id: a.id,
+    name: `${a.handle} · ${a.platform}${
+      multiClient && type === "post"
+        ? ` (${state.clients.find((c) => c.id === a.clientId)?.name || "No client"})`
+        : ""
+    }`,
+  }));
+  // A post's campaign must belong to the same client as its account.
+  const postCampaigns = state.campaigns
+    .filter((c) => !account || c.clientId === account.clientId)
+    .map((c) => ({ id: c.id, name: c.name }));
   const campaignOptions =
     type === "metric"
       ? state.campaigns
@@ -207,27 +382,80 @@ export default function EntityForm({
           .map((c) => ({ id: c.id, name: c.name }))
       : allCampaigns;
   const strategies = state.strategies
-    .filter((s) => s.campaignId === form.campaignId)
+    .filter((s) =>
+      form.campaignId
+        ? s.campaignId === form.campaignId
+        : type === "post" &&
+          state.campaigns.find((c) => c.id === s.campaignId)?.clientId ===
+            account?.clientId,
+    )
     .map((s) => ({ id: s.id, name: s.name }));
+  if (type === "video")
+    return (
+      <UploadedVideo
+        state={state}
+        clientId={clientId}
+        prefill={prefill}
+        onSaveMany={onSaveMany}
+        onClose={onClose}
+        openResults={openResults}
+      />
+    );
+  if (type === "metric" && !value)
+    return (
+      <MetricBatch
+        state={state}
+        prefill={prefill}
+        clientId={clientId}
+        onSaveMany={onSaveMany}
+        onClose={onClose}
+        openStrategy={openStrategy}
+        openResults={openResults}
+      />
+    );
+  const addResultsAfter = React.useRef(false);
   const submit = async (e) => {
     e.preventDefault();
     setBusy(true);
     setError("");
     try {
       let record = { ...form, id: form.id || uid(type) };
+      delete record.duplicateOf;
+      if (type === "client" && !record.startDate) delete record.startDate;
+      if (type === "account") {
+        record.name = (record.name || "").trim();
+        record.handle =
+          (record.handle || "").trim() || record.name || record.platform;
+      }
       if (type === "campaign") {
         record.reviewEveryDays = Number(record.reviewEveryDays);
-        record.goals = record.goals.map((g) => ({
+        record.goals = record.goals.map(({ periodDays, ...g }) => ({
           ...g,
           baseline: Number(g.baseline),
           target: Number(g.target),
+          ...(periodDays && Number(periodDays) >= 1
+            ? { periodDays: Math.round(Number(periodDays)) }
+            : {}),
         }));
       }
-      if (type === "strategy")
+      if (type === "strategy") {
         record.reviewEveryDays = Number(record.reviewEveryDays);
-      if (type === "post")
+        // Once the strategy is explained, stop asking for details.
+        if (record.needsDetails && (record.hypothesis || "").trim())
+          delete record.needsDetails;
+      }
+      if (type === "post") {
         record.reviewAfterDays = Number(record.reviewAfterDays);
-      if (type === "metric") record.value = Number(record.value);
+        // Tactics were added, so stop the "add tactics later" reminder.
+        if ((record.tacticIds || []).length) delete record.tacticsLater;
+        if (record.strategyId) delete record.strategyLater;
+      }
+      if (type === "metric") {
+        record.value = Number(record.value);
+        if (record.periodDays && Number(record.periodDays) >= 1)
+          record.periodDays = Math.round(Number(record.periodDays));
+        else delete record.periodDays;
+      }
       if (type === "reminder") {
         record.threshold = Number(record.threshold);
         if (!record.date) delete record.date;
@@ -240,8 +468,25 @@ export default function EntityForm({
         "goalId",
       ])
         if (record[k] === "") delete record[k];
-      await onSave(collectionMap[type], record);
+      // Numbers saved with an older strategy on this video would block a change.
+      const staleMetrics =
+        type === "post"
+          ? state.metrics.filter(
+              (m) => m.postId === record.id && m.strategyId && m.strategyId !== record.strategyId,
+            )
+          : [];
+      if (type === "post" && (pendingTactics.length || staleMetrics.length))
+        await onSaveMany([
+          ...pendingTacticOps(pendingTactics, record.tacticIds || []),
+          { op: "upsert", collection: "posts", value: record },
+          ...staleMetrics.map((m) => {
+            const { strategyId: _s, ...rest } = m;
+            return { op: "upsert", collection: "metrics", value: rest };
+          }),
+        ]);
+      else await onSave(collectionMap[type], record);
       onClose();
+      if (type === "post" && addResultsAfter.current) openResults?.(record);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -285,13 +530,15 @@ export default function EntityForm({
   );
   return (
     <Dialog
-      title={`${value ? "Edit" : "Add"} ${labels[type]}`}
+      title={`${value ? "Edit" : prefill.duplicateOf ? "Duplicate" : "Add"} ${labels[type]}`}
       description={
         type === "metric"
-          ? "Record a dated observation. Use the same reporting window when comparing results."
+          ? "Change the number or date for this entry."
           : type === "assessment"
-            ? "Turn what happened into something you can test next."
-            : null
+            ? "Write down what happened so you know what to try next."
+            : type === "post" && prefill.duplicateOf
+              ? "This is a copy. Change the date, account or idea, then save it as a new plan."
+              : null
       }
       onClose={onClose}
       wide={["campaign", "assessment", "strategy", "post", "practice"].includes(
@@ -316,6 +563,12 @@ export default function EntityForm({
               <Field label="Brand color">
                 {input("color", { type: "color" })}
               </Field>
+              <Field
+                label="Date you started with this client"
+                hint="Numbers before this date count as 'before', numbers after as 'after'."
+              >
+                {input("startDate", { type: "date", max: today() })}
+              </Field>
               <Field label="Notes" wide>
                 {text(
                   "notes",
@@ -328,22 +581,64 @@ export default function EntityForm({
             <>
               <Field label="Client">{select("clientId", clientOptions)}</Field>
               <Field label="Platform">
-                {select("platform", [
-                  "Instagram",
-                  "TikTok",
-                  "LinkedIn",
-                  "Facebook",
-                  "YouTube",
-                  "Pinterest",
-                  "X",
-                  "Other",
-                ])}
+                <select
+                  value={addingPlatform ? "__new__" : form.platform || ""}
+                  onChange={(e) =>
+                    e.target.value === "__new__"
+                      ? setAddingPlatform(true)
+                      : (setAddingPlatform(false), set("platform", e.target.value))
+                  }
+                >
+                  {[
+                    "Instagram",
+                    "TikTok",
+                    "LinkedIn",
+                    "Facebook",
+                    "YouTube",
+                    "Pinterest",
+                    "X",
+                    ...loadLibrary().platforms,
+                    ...(form.platform ? [form.platform] : []),
+                  ]
+                    .filter((p, i, l) => l.indexOf(p) === i)
+                    .map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  <option value="__new__">+ Add a new platform…</option>
+                </select>
+                {addingPlatform && (
+                  <div className="chip-add">
+                    <input
+                      autoFocus
+                      aria-label="New platform name"
+                      placeholder="e.g. Newsletter, Website, Snapchat"
+                      value={newPlatformName}
+                      onChange={(e) => setNewPlatformName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          applyNewPlatform();
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="btn ghost small"
+                      disabled={!newPlatformName.trim()}
+                      onClick={applyNewPlatform}
+                    >
+                      <Plus size={14} /> Use &amp; save
+                    </button>
+                  </div>
+                )}
               </Field>
               <Field label="Display name">
-                {input("name", { required: true, placeholder: "Brand name" })}
+                {input("name", { placeholder: "Brand name (optional)" })}
               </Field>
               <Field label="Handle / account name">
-                {input("handle", { required: true, placeholder: "@yourbrand" })}
+                {input("handle", { placeholder: "@yourbrand (optional)" })}
               </Field>
               <div className="span-2">
                 <div className="section-label">
@@ -383,19 +678,52 @@ export default function EntityForm({
                       />
                     </Field>
                     <Field label="Unit">
-                      <input
-                        required
-                        value={k.unit}
-                        placeholder="%, people, clicks"
-                        onChange={(e) =>
+                      <select
+                        value={
+                          customUnits.includes(k.id) ||
+                          (k.unit && !UNITS.includes(k.unit))
+                            ? "__other__"
+                            : k.unit
+                        }
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (v === "__other__")
+                            setCustomUnits((l) => [...new Set([...l, k.id])]);
+                          else setCustomUnits((l) => l.filter((x) => x !== k.id));
                           set(
                             "kpis",
                             form.kpis.map((x, j) =>
-                              j === i ? { ...x, unit: e.target.value } : x,
+                              j === i
+                                ? { ...x, unit: v === "__other__" ? "" : v }
+                                : x,
                             ),
-                          )
-                        }
-                      />
+                          );
+                        }}
+                      >
+                        {UNITS.map((u) => (
+                          <option key={u} value={u}>
+                            {u}
+                          </option>
+                        ))}
+                        <option value="__other__">Other…</option>
+                      </select>
+                      {(customUnits.includes(k.id) ||
+                        (k.unit && !UNITS.includes(k.unit))) && (
+                        <input
+                          required
+                          aria-label="Custom unit"
+                          placeholder="Type your unit"
+                          value={k.unit}
+                          onChange={(e) =>
+                            set(
+                              "kpis",
+                              form.kpis.map((x, j) =>
+                                j === i ? { ...x, unit: e.target.value } : x,
+                              ),
+                            )
+                          }
+                        />
+                      )}
                     </Field>
                     <Field label="Better when">
                       <select
@@ -486,32 +814,32 @@ export default function EntityForm({
               </Field>
               <div className="span-2 goals-editor">
                 <div className="section-label">
-                  <h3>Account goals</h3>
+                  <h3>Goals for this campaign</h3>
                   <button
-                    className="btn ghost small"
+                    className="btn secondary small"
                     type="button"
-                    onClick={() => {
-                      const a = state.accounts.find(
-                        (a) => a.clientId === form.clientId,
-                      );
-                      set("goals", [
-                        ...form.goals,
-                        {
-                          id: uid("goal"),
-                          accountId: a?.id || "",
-                          kpiId: a?.kpis[0]?.id || "",
-                          baseline: 0,
-                          target: 100,
-                        },
-                      ]);
-                    }}
+                    onClick={addGoal}
                   >
-                    <Plus size={15} /> Add goal
+                    <Plus size={15} /> Add a goal
                   </button>
                 </div>
+                <p className="muted small">
+                  A goal is <strong>one KPI on one account</strong>: where it
+                  stands when the campaign starts and the number you want it to
+                  reach by the end date. Add one goal per KPI you want to move.
+                  Progress is measured from the running totals you record.
+                </p>
+                {!state.accounts.some((a) => a.clientId === form.clientId) && (
+                  <p className="muted small">
+                    This client has no social accounts yet. Add an account and
+                    its KPIs first, then come back to set goals.
+                  </p>
+                )}
                 {!form.goals.length && (
                   <p className="muted small">
-                    Add a starting value and target for each account KPI.
+                    No goals yet. Click <strong>Add a goal</strong>, choose the
+                    account and KPI, then fill in &ldquo;Where it starts&rdquo;
+                    and &ldquo;Target&rdquo;.
                   </p>
                 )}
                 {form.goals.map((g, i) => {
@@ -523,28 +851,49 @@ export default function EntityForm({
                         j === i ? { ...x, [k]: v } : x,
                       ),
                     );
+                  const k = a?.kpis.find((k) => k.id === g.kpiId);
+                  const latest = latestTotal(
+                    state,
+                    g.accountId,
+                    g.kpiId,
+                    g.periodDays,
+                  );
+                  const pick = (accountId, kpiId, periodDays = g.periodDays) => {
+                    const l = latestTotal(state, accountId, kpiId, periodDays);
+                    set(
+                      "goals",
+                      form.goals.map((x, j) =>
+                        j === i
+                          ? {
+                              ...x,
+                              accountId,
+                              kpiId,
+                              periodDays,
+                              ...(l ? { baseline: String(l.value) } : {}),
+                            }
+                          : x,
+                      ),
+                    );
+                  };
                   return (
                     <div className="goal-editor" key={g.id}>
+                      <h4 className="goal-editor-title">
+                        Goal {i + 1}
+                        {k ? `: ${k.name}` : ""}
+                        {g.periodDays ? ` (${windowLabel(g.periodDays)})` : ""}
+                        {a ? ` on ${a.platform}` : ""}
+                      </h4>
                       <div className="form-grid">
                         <Field label="Social account">
                           <select
                             required
                             value={g.accountId}
                             onChange={(e) =>
-                              set(
-                                "goals",
-                                form.goals.map((x, j) =>
-                                  j === i
-                                    ? {
-                                        ...x,
-                                        accountId: e.target.value,
-                                        kpiId:
-                                          state.accounts.find(
-                                            (a) => a.id === e.target.value,
-                                          )?.kpis[0]?.id || "",
-                                      }
-                                    : x,
-                                ),
+                              pick(
+                                e.target.value,
+                                state.accounts.find(
+                                  (a) => a.id === e.target.value,
+                                )?.kpis[0]?.id || "",
                               )
                             }
                           >
@@ -564,7 +913,7 @@ export default function EntityForm({
                           <select
                             required
                             value={g.kpiId}
-                            onChange={(e) => update("kpiId", e.target.value)}
+                            onChange={(e) => pick(g.accountId, e.target.value)}
                           >
                             <option value="" disabled>
                               Select KPI
@@ -576,19 +925,38 @@ export default function EntityForm({
                             ))}
                           </select>
                         </Field>
-                        <Field label="Starting value">
-                          <input
-                            type="number"
-                            step="any"
+                        <Field
+                          label="Measured as"
+                          hint="Pick Per month (or week/day) to set a goal like “5,000 website visitors per month” instead of an overall total."
+                          wide
+                        >
+                          <PeriodSelect
+                            goal
+                            value={g.periodDays ?? ""}
+                            onChange={(v) => pick(g.accountId, g.kpiId, v)}
+                          />
+                        </Field>
+                        <Field
+                          label="Where it starts"
+                          hint={
+                            latest
+                              ? `Latest recorded: ${fmt(latest.value, k?.unit)} on ${niceDate(latest.date)}`
+                              : "No number recorded yet. Type where it stands now."
+                          }
+                        >
+                          <NumInput
+                            unit={k?.unit}
                             required
                             value={g.baseline}
                             onChange={(e) => update("baseline", e.target.value)}
                           />
                         </Field>
-                        <Field label="Goal value">
-                          <input
-                            type="number"
-                            step="any"
+                        <Field
+                          label="Target"
+                          hint="The number you want to reach by the campaign end date."
+                        >
+                          <NumInput
+                            unit={k?.unit}
                             required
                             value={g.target}
                             onChange={(e) => update("target", e.target.value)}
@@ -610,6 +978,15 @@ export default function EntityForm({
                     </div>
                   );
                 })}
+                {form.goals.length > 0 && (
+                  <button
+                    className="btn secondary small"
+                    type="button"
+                    onClick={addGoal}
+                  >
+                    <Plus size={15} /> Add another goal
+                  </button>
+                )}
               </div>
             </>
           )}
@@ -622,17 +999,17 @@ export default function EntityForm({
                 })}
               </Field>
               {campaignChoice}
-              <Field label="Hypothesis" wide>
+              <Field label="What do you expect to happen?" wide>
                 {text(
                   "hypothesis",
-                  "We believe that… because… We will measure…",
+                  "e.g. We think showing the process will get more people watching to the end, because it feels more personal.",
                 )}
               </Field>
-              <Field label="What are we changing?">
-                {text("changes", "The variable we are testing")}
+              <Field label="What are you changing?">
+                {text("changes", "The one thing you are trying differently")}
               </Field>
               <Field label="What stays the same?">
-                {text("keep", "What we will hold constant")}
+                {text("keep", "e.g. same length and posting time")}
               </Field>
               <Field label="Status">
                 {select("status", [
@@ -672,15 +1049,55 @@ export default function EntityForm({
                   placeholder: "What is this post about?",
                 })}
               </Field>
-              {campaignChoice}
               <Field label="Social account">
-                {select("accountId", accountOptions)}
+                {select("accountId", accountOptions, (v) =>
+                  setForm((f) => {
+                    const next = state.accounts.find((a) => a.id === v);
+                    const keep =
+                      state.campaigns.find((c) => c.id === f.campaignId)
+                        ?.clientId === next?.clientId;
+                    return keep
+                      ? { ...f, accountId: v }
+                      : { ...f, accountId: v, campaignId: "", strategyId: "" };
+                  }),
+                )}
               </Field>
-              <Field label="Strategy">
+              <Field label="Campaign (optional)">
+                {select(
+                  "campaignId",
+                  [{ id: "", name: "No campaign" }, ...postCampaigns],
+                  (v) =>
+                    setForm((f) => ({
+                      ...f,
+                      campaignId: v,
+                      strategyId: "",
+                      ...(v
+                        ? {
+                            accountId:
+                              state.accounts.find(
+                                (a) =>
+                                  a.clientId ===
+                                  state.campaigns.find((c) => c.id === v)?.clientId,
+                              )?.id || f.accountId,
+                          }
+                        : {}),
+                    })),
+                )}
+              </Field>
+              <Field label="Strategy (the bigger approach, optional)">
                 {select("strategyId", [
                   { id: "", name: "No strategy linked" },
                   ...strategies,
                 ])}
+              </Field>
+              <Field label="Tactics used (several allowed)" wide>
+                <TacticPicker
+                  state={state}
+                  value={form.tacticIds || []}
+                  onChange={(ids) => set("tacticIds", ids)}
+                  pending={pendingTactics}
+                  setPending={setPendingTactics}
+                />
               </Field>
               <Field label="Format">
                 {select("format", [
@@ -697,15 +1114,19 @@ export default function EntityForm({
               </Field>
               <Field label="Content readiness">
                 {select("readiness", [
-                  { id: "needed", name: "Need to create / find" },
+                  { id: "needed", name: "To create" },
                   { id: "in-progress", name: "In progress" },
                   { id: "ready", name: "Ready to publish" },
                 ])}
               </Field>
               <Field label="Status">
-                {select("status", ["planned", "executed", "cancelled"])}
+                {select("status", [
+                  { id: "planned", name: "Planned" },
+                  { id: "executed", name: "Published" },
+                  { id: "cancelled", name: "Cancelled" },
+                ])}
               </Field>
-              <Field label="Assess after execution (days)">
+              <Field label="Check results after (days)">
                 {input("reviewAfterDays", {
                   required: true,
                   type: "number",
@@ -713,14 +1134,14 @@ export default function EntityForm({
                 })}
               </Field>
               {form.status === "executed" && (
-                <Field label="Execution date">
+                <Field label="Date it was published">
                   {input("executedAt", { type: "date", max: today() })}
                 </Field>
               )}
               <Field label="Outline / notes" wide>
                 {text(
                   "notes",
-                  "General idea, creative direction, assets needed…",
+                  "What the post is about, how it should look, what you still need…",
                 )}
               </Field>
               <Field label="Published URL (optional)" wide>
@@ -752,8 +1173,44 @@ export default function EntityForm({
                   })),
                 )}
               </Field>
-              <Field label="Date observed">
+              <Field label="Data collected on">
                 {input("date", { required: true, type: "date", max: today() })}
+              </Field>
+              {uploadOf && (
+                <Field
+                  label="Days after upload"
+                  hint={`Video uploaded ${uploadOf}. Changing this moves the date, and changing the date updates this.`}
+                >
+                  <input
+                    type="number"
+                    min="0"
+                    value={
+                      form.date
+                        ? Math.round(
+                            (new Date(`${form.date}T12:00:00Z`) -
+                              new Date(`${uploadOf}T12:00:00Z`)) /
+                              86400000,
+                          )
+                        : ""
+                    }
+                    onChange={(e) => {
+                      const n = Number(e.target.value);
+                      if (e.target.value === "" || !(n >= 0)) return;
+                      const d = addDays(uploadOf, n);
+                      set("date", d > today() ? today() : d);
+                    }}
+                  />
+                </Field>
+              )}
+              <Field
+                label="Type of number"
+                hint="Running total = where it stands on that date. “Over 7 days” = e.g. a video's first-week views or this week's channel views, dated at the end of the period."
+                wide
+              >
+                <PeriodSelect
+                  value={form.periodDays ?? ""}
+                  onChange={(v) => set("periodDays", v)}
+                />
               </Field>
               <Field
                 label="Value"
@@ -763,17 +1220,18 @@ export default function EntityForm({
                     : null
                 }
               >
-                {input("value", {
-                  type: "number",
-                  step: "any",
-                  required: true,
-                })}
+                <NumInput
+                  unit={account?.kpis.find((k) => k.id === form.kpiId)?.unit}
+                  required
+                  value={form.value ?? ""}
+                  onChange={(e) => set("value", e.target.value)}
+                />
               </Field>
               <Field label="Campaign (optional)">
                 {select(
                   "campaignId",
                   [
-                    { id: "", name: "Account-level observation" },
+                    { id: "", name: "Whole account (counts toward goals)" },
                     ...campaignOptions,
                   ],
                   (v) =>
@@ -788,7 +1246,7 @@ export default function EntityForm({
               <Field label="Strategy (optional)">
                 {select(
                   "strategyId",
-                  [{ id: "", name: "None — account total" }, ...strategies],
+                  [{ id: "", name: "None" }, ...strategies],
                   (v) => setForm((f) => ({ ...f, strategyId: v, postId: "" })),
                 )}
               </Field>
@@ -824,68 +1282,133 @@ export default function EntityForm({
               <div className="notice span-2">
                 <Info size={17} />
                 <span>
-                  Post and strategy observations support experiment analysis.
-                  Only account-level observations contribute to overall campaign
-                  goals.
+                  Numbers linked to a post or strategy are used to compare what
+                  worked. Only whole-account numbers (no post or strategy) count
+                  toward a campaign's goal progress.
                 </span>
               </div>
             </>
           )}
-          {type === "assessment" && (
-            <>
-              <Field label="Assess">
-                {select("entityType", ["campaign", "strategy", "post"], (v) =>
-                  setForm((f) => ({
-                    ...f,
-                    entityType: v,
-                    entityId:
-                      state[`${v === "strategy" ? "strategie" : v}s`]?.[0]
-                        ?.id || "",
-                  })),
-                )}
-              </Field>
-              <Field label="Item">
-                {select(
-                  "entityId",
-                  (
-                    state[
-                      {
-                        campaign: "campaigns",
-                        strategy: "strategies",
-                        post: "posts",
-                      }[form.entityType]
-                    ] || []
-                  ).map((x) => ({ id: x.id, name: x.name || x.title })),
-                )}
-              </Field>
-              <Field label="Assessment date">
-                {input("date", { required: true, type: "date", max: today() })}
-              </Field>
-              <Field label="Result">
-                {select("rating", ["positive", "mixed", "negative"])}
-              </Field>
-              <Field label="Summary" wide>
-                {text("summary", "What do the results tell us?")}
-              </Field>
-              <Field label="What did we do differently?">
-                {text("different")}
-              </Field>
-              <Field label="What stayed the same?">{text("same")}</Field>
-              <Field label="What worked better?">{text("better")}</Field>
-              <Field label="What worked worse?">{text("worse")}</Field>
-              <Field label="Next test / decision" wide>
-                {text("nextTest", "One specific change to try next")}
-              </Field>
-              <div className="notice span-2">
-                <Check size={17} />
-                <span>
-                  Saving schedules the next campaign or strategy assessment
-                  using its review interval. A post follow-up is complete after
-                  its first assessment following execution.
-                </span>
-              </div>
-            </>
-          )}
+          {type === "assessment" &&
+            (() => {
+              const target = reviewTarget(state, form.entityType, form.entityId);
+              // Based on the saved record, so the section never folds shut
+              // while you are typing in it.
+              const hasDetail = ["same", "better", "worse"].some((k) =>
+                (value?.[k] || "").trim(),
+              );
+              return (
+                <>
+                  {target && (
+                    <div className="review-target span-2">
+                      <span className="review-target-label">{target.label}</span>
+                      <strong>{target.title}</strong>
+                      {target.results.length ? (
+                        <ul>
+                          {target.results.map((r) => (
+                            <li key={r}>{r}</li>
+                          ))}
+                          {target.more > 0 && (
+                            <li className="muted">
+                              and {target.more} more recorded
+                            </li>
+                          )}
+                        </ul>
+                      ) : (
+                        <p>
+                          No numbers are recorded for this yet, so the
+                          assessment will rest on what you observed.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {pickTarget || !target ? (
+                    <>
+                      <Field label="What are you reviewing?">
+                        {select(
+                          "entityType",
+                          ["campaign", "strategy", "post"],
+                          (v) =>
+                            setForm((f) => ({
+                              ...f,
+                              entityType: v,
+                              entityId:
+                                state[TARGET_COLLECTION[v]]?.[0]?.id || "",
+                            })),
+                        )}
+                      </Field>
+                      <Field label="Which one?">
+                        {select(
+                          "entityId",
+                          (state[TARGET_COLLECTION[form.entityType]] || []).map(
+                            (x) => ({ id: x.id, name: x.name || x.title }),
+                          ),
+                        )}
+                      </Field>
+                    </>
+                  ) : (
+                    <div className="span-2 review-target-switch">
+                      <button
+                        type="button"
+                        className="text-btn"
+                        onClick={(e) => {
+                          const form = e.currentTarget.form;
+                          setPickTarget(true);
+                          // The link disappears, so move focus to the new picker.
+                          requestAnimationFrame(() =>
+                            form?.querySelector("select")?.focus(),
+                          );
+                        }}
+                      >
+                        Review something else
+                      </button>
+                    </div>
+                  )}
+                  <Field label="Date">
+                    {input("date", { required: true, type: "date", max: today() })}
+                  </Field>
+                  <Field label="How did it go?">
+                    {select("rating", [
+                      { id: "positive", name: "Went well" },
+                      { id: "mixed", name: "Mixed results" },
+                      { id: "negative", name: "Did not go well" },
+                    ])}
+                  </Field>
+                  <Field label="Summary" wide>
+                    {text(
+                      "summary",
+                      "In a sentence or two: what happened, and what does it tell you?",
+                    )}
+                  </Field>
+                  <Field label="What did you change?">{text("different")}</Field>
+                  <Field label="What will you try next?">
+                    {text("nextTest", "One specific change to test next")}
+                  </Field>
+                  <details className="span-2 more-detail" open={hasDetail}>
+                    <summary>
+                      More detail (optional): what stayed the same, got better
+                      or got worse
+                    </summary>
+                    <div className="form-grid">
+                      <Field label="What stayed the same?">{text("same")}</Field>
+                      <Field label="What got better?">{text("better")}</Field>
+                      <Field label="What got worse?" wide>
+                        {text("worse")}
+                      </Field>
+                    </div>
+                  </details>
+                  <div className="notice span-2">
+                    <Check size={17} />
+                    <span>
+                      When you save, the next assessment for this campaign or
+                      strategy is scheduled automatically from its interval. For
+                      a post, the reminder to review results goes away once you
+                      have written its first assessment.
+                    </span>
+                  </div>
+                </>
+              );
+            })()}
           {type === "reminder" && (
             <>
               <Field label="Reminder" wide>
@@ -924,10 +1447,10 @@ export default function EntityForm({
                       })),
                     ])}
                   </Field>
-                  <Field label="Notify when progress is">
+                  <Field label="Remind me when progress is">
                     {select("comparison", ["below", "above"])}
                   </Field>
-                  <Field label="Percent of goal achieved">
+                  <Field label="Percent of the way to the goal">
                     {input("threshold", {
                       type: "number",
                       required: true,
@@ -941,10 +1464,10 @@ export default function EntityForm({
           )}
           {type === "practice" && (
             <>
-              <Field label="Practice title" wide>
+              <Field label="What did you learn?" wide>
                 {input("title", {
                   required: true,
-                  placeholder: "A useful principle to test again",
+                  placeholder: "e.g. Behind-the-scenes videos get more reach than product photos",
                 })}
               </Field>
               <Field label="Client">
@@ -955,7 +1478,7 @@ export default function EntityForm({
                     setForm((f) => ({ ...f, clientId: v, strategyId: "" })),
                 )}
               </Field>
-              <Field label="Source strategy">
+              <Field label="Which strategy was this from?">
                 {select("strategyId", [
                   { id: "", name: "Not linked" },
                   ...state.strategies
@@ -968,23 +1491,27 @@ export default function EntityForm({
                     .map((s) => ({ id: s.id, name: s.name })),
                 ])}
               </Field>
-              <Field label="Evidence" wide>
+              <Field label="What did you see?" wide>
                 {text(
                   "evidence",
-                  "Which dated metrics and comparisons support this?",
+                  "The numbers or posts that back this up, with dates.",
                 )}
               </Field>
-              <Field label="Possible explanation" wide>
+              <Field label="Why do you think it worked?" wide>
                 {text(
                   "explanation",
-                  "Explain the hypothesis and alternative explanations.",
+                  "Your best guess, and anything else that could explain it.",
                 )}
               </Field>
-              <Field label="Next test" wide>
-                {text("nextTest", "How can we isolate why this worked?")}
+              <Field label="What should you test next?" wide>
+                {text("nextTest", "One small change that would confirm it, e.g. try a 15-second version.")}
               </Field>
-              <Field label="Confidence">
-                {select("confidence", ["hypothesis", "emerging", "validated"])}
+              <Field label="How sure are you?">
+                {select("confidence", [
+                  { id: "hypothesis", name: "Just an idea" },
+                  { id: "emerging", name: "Looking likely" },
+                  { id: "validated", name: "Proven" },
+                ])}
               </Field>
             </>
           )}
@@ -1027,7 +1554,25 @@ export default function EntityForm({
           >
             Cancel
           </button>
-          <button className="btn primary" disabled={busy}>
+          {type === "post" && !value && form.status === "executed" && (
+            <button
+              className="btn secondary"
+              disabled={busy}
+              title="Save the post, then record its numbers"
+              onClick={() => {
+                addResultsAfter.current = true;
+              }}
+            >
+              Save &amp; add results now
+            </button>
+          )}
+          <button
+            className="btn primary"
+            disabled={busy}
+            onClick={() => {
+              addResultsAfter.current = false;
+            }}
+          >
             {busy ? (
               <LoaderCircle className="spin" size={16} />
             ) : (

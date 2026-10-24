@@ -209,13 +209,23 @@ test("CSV preview, mapping and deduplication are atomic; ambiguous dates do not 
   const bad = await app.request("/api/import/commit", {
     ...input,
     revision: committed.result.state.revision,
-    content: Buffer.from(`Day,Reach\n${today()},180\n03/04/2026,190`).toString(
+    content: Buffer.from(`Day,Reach\n${today()},180\n31/02/2026,190`).toString(
       "base64",
     ),
   });
   assert.equal(bad.status, 400);
-  assert.match(bad.result.error, /Ambiguous dates/);
+  assert.match(bad.result.error, /date must be like/);
   assert.equal((await app.state()).metrics.length, 1);
+  const dayFirst = await app.request("/api/import/commit", {
+    ...input,
+    revision: committed.result.state.revision,
+    content: Buffer.from("Day,Reach\n21/09/2026,500\n03/04/2026,510").toString(
+      "base64",
+    ),
+  });
+  assert.equal(dayFirst.status, 200);
+  const dates = (await app.state()).metrics.map((m) => m.date);
+  assert.ok(dates.includes("2026-09-21") && dates.includes("2026-04-03"));
 });
 
 test("XLSX preserves worksheet choice and Excel dates; formulas are never imported", async (t) => {
@@ -361,4 +371,114 @@ test("imports percentage-point values consistently from Excel formatting and CSV
   assert.equal(formatted.result.imported, 1);
   assert.equal(formatted.result.skipped, 1);
   assert.equal(formatted.result.state.metrics.at(-1).value, 1234.5);
+});
+
+test("tactics: old workspaces load, posts can carry several, and a tactic in use cannot be deleted", async (t) => {
+  const app = await setup(t);
+  // The fixture was saved before tactics existed.
+  let state = await app.state();
+  assert.deepEqual(state.tactics, []);
+  const post = {
+    id: "post-t",
+    campaignId: "campaign",
+    accountId: "account",
+    title: "Video",
+    format: "Video",
+    date: today(),
+    status: "executed",
+    executedAt: today(),
+    readiness: "ready",
+    notes: "",
+    url: "",
+    tacticIds: ["tactic-a", "tactic-b"],
+  };
+  const missing = await app.request("/api/mutate", {
+    revision: state.revision,
+    operations: [upsert("posts", post)],
+  });
+  assert.equal(missing.status, 400);
+  const ok = await app.request("/api/mutate", {
+    revision: state.revision,
+    operations: [
+      upsert("tactics", { id: "tactic-a", name: "CTA in first 2 minutes" }),
+      upsert("tactics", { id: "tactic-b", name: "Casual tone", category: "tone" }),
+      upsert("posts", post),
+    ],
+  });
+  assert.equal(ok.status, 200);
+  const blocked = await app.request("/api/mutate", {
+    revision: ok.result.revision,
+    operations: [{ op: "delete", collection: "tactics", id: "tactic-a" }],
+  });
+  assert.equal(blocked.status, 400);
+  const freed = await app.request("/api/mutate", {
+    revision: ok.result.revision,
+    operations: [
+      upsert("posts", { ...post, tacticIds: ["tactic-b"] }),
+      { op: "delete", collection: "tactics", id: "tactic-a" },
+    ],
+  });
+  assert.equal(freed.status, 200);
+  const dup = await app.request("/api/mutate", {
+    revision: freed.result.revision,
+    operations: [upsert("posts", { ...post, tacticIds: ["tactic-b", "tactic-b"] })],
+  });
+  assert.equal(dup.status, 400);
+});
+
+test("theories reference a real tactic, account and KPI", async (t) => {
+  const app = await setup(t);
+  const state = await app.state();
+  const base = { id: "theory-1", tacticId: "tactic-a", accountId: "account", kpiId: "reach", periodDays: 7, statement: "CTA early lifts reach", startedAt: today(), status: "testing" };
+  const bad = await app.request("/api/mutate", { revision: state.revision, operations: [upsert("theories", base)] });
+  assert.equal(bad.status, 400);
+  const ok = await app.request("/api/mutate", {
+    revision: state.revision,
+    operations: [upsert("tactics", { id: "tactic-a", name: "CTA early" }), upsert("theories", base)],
+  });
+  assert.equal(ok.status, 200);
+  const wrongKpi = await app.request("/api/mutate", { revision: ok.result.revision, operations: [upsert("theories", { ...base, kpiId: "nope" })] });
+  assert.equal(wrongKpi.status, 400);
+  const blocked = await app.request("/api/mutate", { revision: ok.result.revision, operations: [{ op: "delete", collection: "tactics", id: "tactic-a" }] });
+  assert.equal(blocked.status, 400);
+});
+
+test("a post does not have to belong to a campaign, but its references must still agree", async (t) => {
+  const app = await setup(t);
+  const state = await app.state();
+  const loose = {
+    id: "post-loose",
+    accountId: "account",
+    title: "Standalone video",
+    format: "Video",
+    date: today(),
+    status: "executed",
+    executedAt: today(),
+    readiness: "ready",
+    notes: "",
+    url: "",
+  };
+  const ok = await app.request("/api/mutate", {
+    revision: state.revision,
+    operations: [
+      upsert("posts", loose),
+      upsert("metrics", { id: "m-loose", accountId: "account", kpiId: "reach", date: today(), value: 10, postId: "post-loose" }),
+    ],
+  });
+  assert.equal(ok.status, 200);
+  // A strategy of the same client may still be linked.
+  const withStrategy = await app.request("/api/mutate", {
+    revision: ok.result.revision,
+    operations: [
+      upsert("strategies", { id: "strategy-x", campaignId: "campaign", name: "S", hypothesis: "", changes: "", keep: "", status: "testing", reviewEveryDays: 7, nextReviewDate: today() }),
+      upsert("posts", { ...loose, strategyId: "strategy-x" }),
+    ],
+  });
+  assert.equal(withStrategy.status, 200);
+  // But a metric cannot claim a campaign the post is not in.
+  const wrong = await app.request("/api/mutate", {
+    revision: withStrategy.result.revision,
+    operations: [upsert("metrics", { id: "m-wrong", accountId: "account", kpiId: "reach", date: today(), value: 11, postId: "post-loose", campaignId: "campaign" })],
+  });
+  assert.equal(wrong.status, 400);
 });

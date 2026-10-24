@@ -8,6 +8,7 @@ import {
   X,
 } from "lucide-react";
 
+import { PeriodSelect } from "./components.jsx";
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const SAMPLE_CSV =
   "date,value\n2026-09-01,1200\n2026-09-08,1380\n2026-09-15,1525\n";
@@ -71,6 +72,7 @@ export default function ImportPanel({
   const [kpiId, setKpiId] = useState("");
   const [campaignId, setCampaignId] = useState("");
   const [strategyId, setStrategyId] = useState("");
+  const [periodDays, setPeriodDays] = useState("");
   const [postId, setPostId] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -253,6 +255,9 @@ export default function ImportPanel({
         ...(campaignId ? { campaignId } : {}),
         ...(strategyId ? { strategyId } : {}),
         ...(postId ? { postId } : {}),
+        ...(periodDays && Number(periodDays) >= 1
+          ? { periodDays: Math.round(Number(periodDays)) }
+          : {}),
       });
       onState(imported.state);
       setResult({
@@ -655,6 +660,10 @@ export default function ImportPanel({
                   to a campaign, strategy, or content item.
                 </p>
                 <div className="form-grid">
+                  <div className="field">
+                    Type of number in the file
+                    <PeriodSelect value={periodDays} onChange={setPeriodDays} />
+                  </div>
                   <label className="field">
                     Campaign
                     <select

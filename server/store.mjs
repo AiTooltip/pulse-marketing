@@ -14,13 +14,27 @@ export const collections = [
   "accounts",
   "campaigns",
   "strategies",
+  "tactics",
+  "theories",
   "posts",
   "metrics",
   "assessments",
   "reminders",
+  "tasks",
+  "competitors",
+  "benchmarks",
+  "intel",
   "practices",
 ];
-const allCollections = [...collections, "activity"];
+const TASK_KINDS = [
+  "todo",
+  "assess",
+  "strategy",
+  "tactics",
+  "weekly-analysis",
+  "monthly-analysis",
+];
+const allCollections =[...collections, "activity"];
 export const emptyState = () => ({
   schemaVersion: 1,
   revision: "",
@@ -72,6 +86,12 @@ const id = (v, label) => {
 export function validateState(s) {
   object(s, "State");
   if (s.schemaVersion !== 1) fail("Unsupported schemaVersion. Expected 1.");
+  // Workspaces saved before tactics existed simply have none.
+  if (s.tactics === undefined) s.tactics = [];
+  if (s.theories === undefined) s.theories = [];
+  if (s.tasks === undefined) s.tasks = [];
+  for (const k of ["competitors", "benchmarks", "intel"])
+    if (s[k] === undefined) s[k] = [];
   object(s.settings, "settings");
   str(s.settings.workspaceName, "settings.workspaceName");
   interval(s.settings.postReviewDays, "settings.postReviewDays");
@@ -99,12 +119,13 @@ export function validateState(s) {
   for (const c of s.clients) {
     str(c.name, "Client name");
     optionalText(c, ["industry", "color", "notes"], "Client");
+    date(c.startDate, "Client start date", false);
   }
   for (const a of s.accounts) {
     ref("clients", a.clientId, "Account client");
     str(a.platform, "Account platform");
-    str(a.handle, "Account handle");
-    str(a.name, "Account name");
+    str(a.handle, "Account handle", false);
+    str(a.name, "Account name", false);
     if (!Array.isArray(a.kpis) || a.kpis.length > 100)
       fail("Account KPIs must be an array of at most 100 entries.");
     const seen = new Set();
@@ -152,9 +173,13 @@ export function validateState(s) {
         fail(
           "Campaign goals must use accounts belonging to the campaign client.",
         );
-      const dim = `${g.accountId}:${g.kpiId}`;
+      if (g.periodDays !== undefined)
+        interval(g.periodDays, "Goal period (days)");
+      const dim = `${g.accountId}:${g.kpiId}:${g.periodDays || 0}`;
       if (dimensions.has(dim))
-        fail("Campaign has duplicate goals for the same account and KPI.");
+        fail(
+          "Campaign has duplicate goals for the same account, KPI and period.",
+        );
       dimensions.add(dim);
       num(g.baseline, "Goal baseline");
       num(g.target, "Goal target");
@@ -181,16 +206,55 @@ export function validateState(s) {
     interval(st.reviewEveryDays, "Strategy review interval");
     date(st.nextReviewDate, "Strategy next review");
   }
+  for (const t of s.tactics) {
+    str(t.name, "Tactic name");
+    if (t.name.length > 200) fail("Tactic name is too long.");
+    optionalText(t, ["description", "category"], "Tactic");
+    if (t.status !== undefined)
+      oneOf(
+        t.status,
+        ["idea", "testing", "promising", "proven", "adopted", "paused"],
+        "Tactic status",
+      );
+  }
+  for (const th of s.theories) {
+    ref("tactics", th.tacticId, "Theory tactic");
+    const acc = ref("accounts", th.accountId, "Theory account");
+    if (!acc.kpis.some((k) => k.id === th.kpiId))
+      fail("Theory KPI does not belong to its account.");
+    if (th.periodDays !== undefined) interval(th.periodDays, "Theory period (days)");
+    str(th.statement, "Theory statement");
+    date(th.startedAt, "Theory start date");
+    oneOf(th.status, ["testing", "proven", "disproven", "paused"], "Theory status");
+    date(th.decidedAt, "Theory decided date", false);
+    optionalText(th, ["note"], "Theory");
+  }
   for (const p of s.posts) {
-    const c = ref("campaigns", p.campaignId, "Post campaign"),
-      a = ref("accounts", p.accountId, "Post account");
-    if (c.clientId !== a.clientId)
+    if (p.tacticsLater !== undefined && typeof p.tacticsLater !== "boolean")
+      fail("Post tacticsLater must be true or false.");
+    if (p.strategyLater !== undefined && typeof p.strategyLater !== "boolean")
+      fail("Post strategyLater must be true or false.");
+    if (p.tacticIds !== undefined) {
+      if (!Array.isArray(p.tacticIds) || p.tacticIds.length > 60)
+        fail("Post tactics must be a list of at most 60 tactic IDs.");
+      if (new Set(p.tacticIds).size !== p.tacticIds.length)
+        fail("Post lists the same tactic twice.");
+      for (const tid of p.tacticIds) ref("tactics", tid, "Post tactic");
+    }
+    // A post does not have to belong to a campaign.
+    const a = ref("accounts", p.accountId, "Post account");
+    const c = p.campaignId ? ref("campaigns", p.campaignId, "Post campaign") : null;
+    if (c && c.clientId !== a.clientId)
       fail("Post account must belong to its campaign client.");
-    if (
-      p.strategyId &&
-      ref("strategies", p.strategyId, "Post strategy").campaignId !== c.id
-    )
-      fail("Post strategy must belong to its campaign.");
+    if (p.strategyId) {
+      const st = ref("strategies", p.strategyId, "Post strategy");
+      if (c ? st.campaignId !== c.id : lookup.campaigns.get(st.campaignId)?.clientId !== a.clientId)
+        fail(
+          c
+            ? "Post strategy must belong to its campaign."
+            : "Post strategy must belong to the same client as the post's account.",
+        );
+    }
     str(p.title, "Post title");
     oneOf(
       p.format,
@@ -213,6 +277,8 @@ export function validateState(s) {
     const a = accountKpi(m.accountId, m.kpiId);
     date(m.date, "Metric date");
     num(m.value, "Metric value");
+    if (m.periodDays !== undefined)
+      interval(m.periodDays, "Metric period (days)");
     optionalText(m, ["source"], "Metric");
     let c = m.campaignId
       ? ref("campaigns", m.campaignId, "Metric campaign")
@@ -272,6 +338,67 @@ export function validateState(s) {
       oneOf(r.comparison, ["below", "above"], "Reminder comparison");
     }
   }
+  for (const t of s.tasks) {
+    str(t.title, "Task title");
+    str(t.notes, "Task notes", false);
+    oneOf(t.kind, TASK_KINDS, "Task kind");
+    if (typeof t.done !== "boolean") fail("Task done must be boolean.");
+    if (t.clientId) ref("clients", t.clientId, "Task client");
+    date(t.dueDate, "Task due date", false);
+    date(t.completedAt, "Task completed date", false);
+    if (t.repeat !== undefined) oneOf(t.repeat, ["weekly", "monthly"], "Task repeat");
+  }
+  for (const c of s.competitors) {
+    ref("clients", c.clientId, "Competitor client");
+    str(c.name, "Competitor name");
+    oneOf(c.tier, ["direct", "indirect", "aspirational"], "Competitor tier");
+    oneOf(c.threat, ["high", "medium", "low"], "Competitor threat level");
+    optionalText(
+      c,
+      ["website", "positioning", "audience", "offer", "strengths", "weaknesses", "notes"],
+      "Competitor",
+    );
+    if (!Array.isArray(c.channels) || c.channels.length > 30)
+      fail("Competitor channels must be a list of at most 30 entries.");
+    for (const ch of c.channels) {
+      object(ch, "Competitor channel");
+      str(ch.platform, "Competitor channel platform");
+      str(ch.handle, "Competitor channel handle", false);
+    }
+  }
+  for (const b of s.benchmarks) {
+    const c = ref("competitors", b.competitorId, "Benchmark competitor");
+    void c;
+    str(b.platform, "Benchmark platform");
+    date(b.date, "Benchmark date");
+    const given = ["followers", "postsPerWeek", "engagementRate", "avgViews"].filter(
+      (k) => b[k] !== undefined,
+    );
+    if (!given.length) fail("A benchmark needs at least one number.");
+    for (const k of given) {
+      num(b[k], `Benchmark ${k}`);
+      if (b[k] < 0) fail(`Benchmark ${k} cannot be negative.`);
+    }
+    if (b.engagementRate !== undefined && b.engagementRate > 100)
+      fail("Benchmark engagementRate is a percentage from 0 to 100.");
+    optionalText(b, ["source"], "Benchmark");
+  }
+  for (const i of s.intel) {
+    const client = ref("clients", i.clientId, "Intel client");
+    if (i.competitorId) {
+      const c = ref("competitors", i.competitorId, "Intel competitor");
+      if (c.clientId !== client.id)
+        fail("Intel competitor must belong to the same client.");
+    }
+    date(i.date, "Intel date");
+    oneOf(
+      i.category,
+      ["content", "messaging", "campaign", "product", "pricing", "other"],
+      "Intel category",
+    );
+    str(i.observation, "Intel observation");
+    optionalText(i, ["implication", "source"], "Intel");
+  }
   for (const p of s.practices) {
     const client = p.clientId
       ? ref("clients", p.clientId, "Practice client")
@@ -285,6 +412,7 @@ export function validateState(s) {
       lookup.campaigns.get(st.campaignId).clientId !== client.id
     )
       fail("Practice strategy must belong to its client.");
+    if (p.tacticId) ref("tactics", p.tacticId, "Practice tactic");
     str(p.title, "Practice title");
     optionalText(p, ["evidence", "explanation", "nextTest"], "Practice");
     oneOf(
@@ -496,6 +624,7 @@ export function createStore(dataFile) {
             m.campaignId || "",
             m.strategyId || "",
             m.postId || "",
+            m.periodDays || 0,
           ]);
         const seen = new Set(state.metrics.map(key));
         let imported = 0,

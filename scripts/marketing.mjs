@@ -60,6 +60,7 @@ function makeBrief(state) {
           account: account?.handle || account?.name,
           kpi: kpi?.name,
           unit: kpi?.unit,
+          periodDays: goal.periodDays,
           baseline: goal.baseline,
           target: goal.target,
           current: progress.current,
@@ -92,6 +93,17 @@ function makeBrief(state) {
       plannedPosts: state.posts.filter((p) => p.status === "planned").length,
     },
     notifications: alerts,
+    tasks: (state.tasks || [])
+      .filter((t) => !t.done)
+      .map((t) => ({
+        title: t.title,
+        kind: t.kind,
+        client: state.clients.find((c) => c.id === t.clientId)?.name,
+        dueDate: t.dueDate,
+        repeat: t.repeat,
+        overdue: Boolean(t.dueDate && t.dueDate < today()),
+      }))
+      .sort((a, b) => (a.dueDate || "9999").localeCompare(b.dueDate || "9999")),
     campaigns,
     topStrategies: strategies,
     interpretation:
@@ -111,6 +123,11 @@ function printBrief(brief) {
     console.log(
       `- [${item.severity}] ${item.title}${item.date ? ` (${item.date})` : ""}${item.detail ? ` — ${item.detail}` : ""}`,
     );
+  if (brief.tasks.length) console.log("\nOpen tasks");
+  for (const t of brief.tasks)
+    console.log(
+      `- ${t.overdue ? "[overdue] " : ""}${t.title}${t.client ? ` · ${t.client}` : ""}${t.dueDate ? ` (due ${t.dueDate})` : ""}${t.repeat ? ` · repeats ${t.repeat}` : ""}`,
+    );
   if (brief.campaigns.length) console.log("\nActive campaigns");
   for (const campaign of brief.campaigns) {
     console.log(
@@ -121,7 +138,7 @@ function printBrief(brief) {
         ? `${Math.round(goal.progress)}% of baseline-to-target change`
         : "progress unavailable";
       console.log(
-        `  ${goal.account} / ${goal.kpi}: ${goal.current} → ${goal.target} ${goal.unit || ""}; ${goal.hasData ? progress : "no observations yet"}`,
+        `  ${goal.account} / ${goal.kpi}${goal.periodDays ? ` (per ${goal.periodDays} days)` : ""}: ${goal.current} → ${goal.target} ${goal.unit || ""}; ${goal.hasData ? progress : "no observations yet"}`,
       );
     }
   }

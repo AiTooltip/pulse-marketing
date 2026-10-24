@@ -27,6 +27,7 @@ export function goalProgress(state, campaign, goal) {
       (!m.campaignId || m.campaignId === campaign.id) &&
       !m.strategyId &&
       !m.postId &&
+      (m.periodDays || 0) === (goal.periodDays || 0) &&
       m.date >= campaign.startDate &&
       m.date <= campaign.endDate &&
       m.date <= now &&
@@ -60,10 +61,15 @@ export function goalProgress(state, campaign, goal) {
   };
 }
 
+const READINESS_DETAIL = {
+  needed: "content still to create",
+  "in-progress": "content in progress",
+  ready: "content ready",
+};
 export function notifications(state, now = today()) {
   const items = [];
   const horizon = addDays(now, 7);
-  const add = (id, title, detail, date, entityType, entityId) => {
+  const add = (id, title, detail, date, entityType, entityId, kind) => {
     if (!date || date > horizon) return;
     items.push({
       id,
@@ -73,6 +79,7 @@ export function notifications(state, now = today()) {
       severity: date < now ? "overdue" : date === now ? "due" : "upcoming",
       entityType,
       entityId,
+      ...(kind ? { kind } : {}),
     });
   };
   const running = new Set(
@@ -85,7 +92,7 @@ export function notifications(state, now = today()) {
       add(
         `campaign:${c.id}`,
         `Assess ${c.name}`,
-        `Campaign assessment · every ${c.reviewEveryDays} days`,
+        `Campaign review · every ${c.reviewEveryDays} days`,
         c.nextReviewDate,
         "campaign",
         c.id,
@@ -95,17 +102,53 @@ export function notifications(state, now = today()) {
       add(
         `strategy:${s.id}`,
         `Review ${s.name}`,
-        `Strategy assessment · every ${s.reviewEveryDays} days`,
+        `Strategy review · every ${s.reviewEveryDays} days`,
         s.nextReviewDate,
         "strategy",
         s.id,
+      );
+  // Strategies created with just a name: ask for the explanation until it is added.
+  for (const s of state.strategies || [])
+    if (s.needsDetails && s.status !== "paused")
+      add(
+        `details:${s.id}`,
+        `Add details to “${s.name}”`,
+        "Explain what you are testing, what changes and what stays the same",
+        now,
+        "strategy",
+        s.id,
+        "details",
+      );
+  // Videos saved with "add strategy later": remind until one is linked.
+  for (const p of state.posts || [])
+    if (p.strategyLater && !p.strategyId && p.status !== "cancelled")
+      add(
+        `strategy:${p.id}`,
+        `Add a strategy to “${p.title}”`,
+        "Link the overall approach this video is part of so you can compare strategies",
+        now,
+        "post",
+        p.id,
+        "strategy",
+      );
+  // Videos saved with "add tactics later": remind until tactics are tagged.
+  for (const p of state.posts || [])
+    if (p.tacticsLater && !(p.tacticIds || []).length && p.status !== "cancelled")
+      add(
+        `tactics:${p.id}`,
+        `Add tactics to “${p.title}”`,
+        "Tag the specific choices you made so it can be compared later",
+        now,
+        "post",
+        p.id,
+        "tactics",
       );
   for (const p of state.posts || []) {
     if (p.status === "planned")
       add(
         `publish:${p.id}`,
         p.title,
-        `${p.format} planned · content ${p.readiness}`,
+        `${p.format} · ${READINESS_DETAIL[p.readiness] || `content ${p.readiness}`}`,
         p.date,
         "post",
         p.id,
@@ -121,7 +164,7 @@ export function notifications(state, now = today()) {
         add(
           `assess:${p.id}`,
           `Assess ${p.title}`,
-          "Review results and capture what changed",
+          "Review its results and note what changed",
           addDays(
             p.executedAt,
             p.reviewAfterDays ?? state.settings?.postReviewDays ?? 7,
@@ -137,7 +180,7 @@ export function notifications(state, now = today()) {
       add(
         `reminder:${r.id}`,
         r.title,
-        "Scheduled reminder",
+        "Dated reminder",
         r.date,
         "reminder",
         r.id,
@@ -155,7 +198,7 @@ export function notifications(state, now = today()) {
         add(
           `reminder:${r.id}`,
           r.title,
-          `${Math.round(progress.percent)}% of goal progress · trigger ${r.comparison} ${r.threshold}%${progress.hasData ? "" : " · no observations yet"}`,
+          `${Math.round(progress.percent)}% of the way to the goal · set to alert ${r.comparison} ${r.threshold}%${progress.hasData ? "" : " · no numbers recorded yet"}`,
           now,
           "reminder",
           r.id,
@@ -186,6 +229,7 @@ export function strategyPerformance(state, strategy) {
   const rows = (state.metrics || []).filter(
     (m) =>
       (m.strategyId === strategy.id || posts.has(m.postId)) &&
+      !m.periodDays &&
       m.date >= campaign.startDate &&
       m.date <= campaign.endDate &&
       m.date <= today(),
@@ -198,7 +242,8 @@ export function strategyPerformance(state, strategy) {
   }
   const metrics = [...latest.values()].flatMap((m) => {
     const goal = campaign.goals.find(
-      (g) => g.accountId === m.accountId && g.kpiId === m.kpiId,
+      (g) =>
+        g.accountId === m.accountId && g.kpiId === m.kpiId && !g.periodDays,
     );
     if (!goal) return [];
     const kpi = (state.accounts || [])

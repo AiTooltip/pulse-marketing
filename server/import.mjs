@@ -179,7 +179,41 @@ export function previewResult(parsed) {
   };
 }
 
-function dateValue(value, row) {
+const SLASH_DATE = /^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})$/;
+const MONTH_NAMES = "jan feb mar apr may jun jul aug sep oct nov dec".split(" ");
+const ymd = (y, m, d) => {
+  const text = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  return validDate(text) ? text : null;
+};
+/** 21/09/2026 is day-first, 09/21/2026 month-first; all-ambiguous columns are read day-first. */
+function detectDateOrder(values) {
+  let dmy = false,
+    mdy = false;
+  for (const v of values) {
+    const m = typeof v === "string" ? v.trim().match(SLASH_DATE) : null;
+    if (!m) continue;
+    if (Number(m[1]) > 12) dmy = true;
+    if (Number(m[2]) > 12) mdy = true;
+  }
+  if (dmy && mdy)
+    fail("The date column mixes day/month and month/day order. Use one format.");
+  return mdy ? "mdy" : "dmy";
+}
+function textDate(value, order) {
+  if (typeof value !== "string") return null;
+  const t = value.trim();
+  let m = t.match(SLASH_DATE);
+  if (m) return order === "mdy" ? ymd(m[3], m[1], m[2]) : ymd(m[3], m[2], m[1]);
+  m =
+    t.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})$/) ||
+    t.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$/);
+  if (!m) return null;
+  const [d, mon, y] = /^\d/.test(m[1]) ? [m[1], m[2], m[3]] : [m[2], m[1], m[3]];
+  const mi = MONTH_NAMES.indexOf(mon.slice(0, 3).toLowerCase());
+  return mi < 0 ? null : ymd(y, mi + 1, d);
+}
+
+function dateValue(value, row, order = "dmy") {
   if (value?.formula)
     fail(
       `Row ${row}: formula dates cannot be imported. Replace formulas with values.`,
@@ -187,6 +221,8 @@ function dateValue(value, row) {
   if (value instanceof Date && Number.isFinite(value.getTime()))
     return value.toISOString().slice(0, 10);
   if (typeof value === "string" && validDate(value.trim())) return value.trim();
+  const written = textDate(value, order);
+  if (written) return written;
   if (
     typeof value === "number" ||
     (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim()))
@@ -198,7 +234,7 @@ function dateValue(value, row) {
         .slice(0, 10);
   }
   fail(
-    `Row ${row}: date must be YYYY-MM-DD or an Excel date. Ambiguous dates are not imported.`,
+    `Row ${row}: date must be like 2026-09-21, 21/09/2026, 21 Sep 2026 or an Excel date.`,
   );
 }
 
@@ -233,10 +269,19 @@ export function mappedMetrics(parsed, input) {
   const dimensions = { accountId: input.accountId, kpiId: input.kpiId };
   for (const field of ["campaignId", "strategyId", "postId"])
     if (input[field]) dimensions[field] = input[field];
+  if (input.periodDays !== undefined && input.periodDays !== null && input.periodDays !== "") {
+    const days = Number(input.periodDays);
+    if (!Number.isInteger(days) || days < 1 || days > 3650)
+      fail("periodDays must be a whole number of days.");
+    dimensions.periodDays = days;
+  }
   if (!parsed.records.length) fail("The selected table has no data rows.");
+  const order = detectDateOrder(
+    parsed.records.map((row) => row[input.mapping.date]),
+  );
   return parsed.records.map((row, i) => ({
     ...dimensions,
-    date: dateValue(row[input.mapping.date], i + 2),
+    date: dateValue(row[input.mapping.date], i + 2, order),
     value: numericValue(row[input.mapping.value], i + 2),
   }));
 }
